@@ -1,0 +1,165 @@
+// ============================================================================
+// Chrome AI Model Policy - Advanced Hunting Queries
+// Microsoft Defender XDR | DeviceFileEvents / DeviceEvents
+//
+// Author:    Petr Beloch (CSGM DIW)
+// Co-Author: Claude
+// Version:   1.0.0
+//
+// Usage:
+//   Run these queries in Defender XDR -> Advanced Hunting before and after
+//   deploying the Intune Proactive Remediation to track exposure and remediation.
+//
+// Recommended sequence:
+//   1. Run Query 1 (baseline) BEFORE deploying remediation - export as CSV
+//   2. Run Query 2 (device summary) for executive overview
+//   3. Deploy Intune remediation
+//   4. Run Query 3 (event log audit) to confirm remediation ran per device
+//   5. Run Query 4 (policy verification) to confirm policy is in place
+//   6. Run Query 5 (report file) to list devices with HTML reports generated
+// ============================================================================
+
+
+// ============================================================================
+// QUERY 1 - BASELINE: Devices with Chrome AI model files (pre-remediation)
+// Run this BEFORE deploying remediation to capture the initial exposure snapshot.
+// Exports: DeviceName, FolderPath, FileName, FileSize, first/last seen timestamps
+// ============================================================================
+
+DeviceFileEvents
+| where TimeGenerated > ago(30d)
+| where FolderPath has "Google\\Chrome\\User Data"
+    and (
+        FolderPath has "OptGuideOnDeviceModel"
+        or FolderPath has "OptimizationGuidePredictionModels"
+    )
+| summarize
+    FirstSeen      = min(TimeGenerated),
+    LastSeen       = max(TimeGenerated),
+    TotalFileBytes = sum(FileSize),
+    FileCount      = dcount(FileName)
+    by DeviceName, FolderPath
+| extend TotalFileMB = round(toreal(TotalFileBytes) / 1048576, 2)
+| project DeviceName, FolderPath, FileCount, TotalFileMB, FirstSeen, LastSeen
+| sort by TotalFileMB desc
+
+
+// ============================================================================
+// QUERY 2 - DEVICE SUMMARY: Affected devices with total AI model storage
+// Executive / compliance overview - one row per device.
+// ============================================================================
+
+DeviceFileEvents
+| where TimeGenerated > ago(30d)
+| where FolderPath has "Google\\Chrome\\User Data"
+    and (
+        FolderPath has "OptGuideOnDeviceModel"
+        or FolderPath has "OptimizationGuidePredictionModels"
+    )
+| summarize
+    FirstSeen       = min(TimeGenerated),
+    LastSeen        = max(TimeGenerated),
+    TotalFileBytes  = sum(FileSize),
+    ArtifactFolders = dcount(FolderPath)
+    by DeviceName
+| extend TotalSizeGB = round(toreal(TotalFileBytes) / 1073741824, 2)
+| project DeviceName, ArtifactFolders, TotalSizeGB, FirstSeen, LastSeen
+| sort by TotalSizeGB desc
+
+
+// ============================================================================
+// QUERY 3 - EVENT LOG AUDIT: Devices where remediation ran and wrote Event Log
+// The remediation script writes EventID 9001 to the Application log,
+// Source = "ChromeAIModelPolicy", before applying the registry policy.
+// This query finds devices that have that record - confirms script executed.
+//
+// Note: Custom Application Event Log entries are surfaced in Defender XDR
+// via DeviceEvents when MDE sensors collect them (requires MDE full deployment).
+// If entries are not visible here, check the HTML report query (Query 5) instead.
+// ============================================================================
+
+DeviceEvents
+| where TimeGenerated > ago(30d)
+| where AdditionalFields has "ChromeAIModelPolicy"
+    or AdditionalFields has "OptimizationGuideModelDownloading"
+| project
+    TimeGenerated,
+    DeviceName,
+    ActionType,
+    AdditionalFields
+| sort by TimeGenerated desc
+
+
+// ============================================================================
+// QUERY 4 - POLICY VERIFICATION: Devices where Chrome policy registry was set
+// Looks for registry write events targeting the Chrome Enterprise Policy key.
+// Confirms the policy value was applied by the remediation script.
+// ============================================================================
+
+DeviceRegistryEvents
+| where TimeGenerated > ago(30d)
+| where RegistryKey has "SOFTWARE\\Policies\\Google\\Chrome"
+    and RegistryValueName == "OptimizationGuideModelDownloading"
+| project
+    TimeGenerated,
+    DeviceName,
+    ActionType,
+    RegistryKey,
+    RegistryValueName,
+    RegistryValueData,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine
+| sort by TimeGenerated desc
+
+
+// ============================================================================
+// QUERY 5 - REPORT FILE: Devices where the HTML remediation report was created
+// The remediation script saves a report to:
+//   C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\
+//   Remediate-ChromeAIModelPolicy-Report.html
+// Presence of this file confirms the remediation script completed Phase 5.
+// ============================================================================
+
+DeviceFileEvents
+| where TimeGenerated > ago(30d)
+| where FileName == "Remediate-ChromeAIModelPolicy-Report.html"
+    and FolderPath has "IntuneManagementExtension\\Logs"
+| project
+    TimeGenerated,
+    DeviceName,
+    FolderPath,
+    FileName,
+    FileSize,
+    ActionType
+| sort by TimeGenerated desc
+
+
+// ============================================================================
+// QUERY 6 - COMPLIANCE GAP: Devices with AI model artifacts but NO policy set
+// Identifies devices still at risk - artifacts present AND no registry event
+// recorded for the Chrome policy key. Use as a remediation targeting query.
+// ============================================================================
+
+let DevicesWithArtifacts =
+    DeviceFileEvents
+    | where TimeGenerated > ago(30d)
+    | where FolderPath has "Google\\Chrome\\User Data"
+        and (
+            FolderPath has "OptGuideOnDeviceModel"
+            or FolderPath has "OptimizationGuidePredictionModels"
+        )
+    | summarize TotalFileBytes = sum(FileSize) by DeviceName
+    | extend TotalSizeGB = round(toreal(TotalFileBytes) / 1073741824, 2);
+
+let DevicesWithPolicyApplied =
+    DeviceRegistryEvents
+    | where TimeGenerated > ago(30d)
+    | where RegistryKey has "SOFTWARE\\Policies\\Google\\Chrome"
+        and RegistryValueName == "OptimizationGuideModelDownloading"
+        and RegistryValueData == "0"
+    | summarize PolicyApplied = max(TimeGenerated) by DeviceName;
+
+DevicesWithArtifacts
+| join kind=leftanti DevicesWithPolicyApplied on DeviceName
+| project DeviceName, TotalSizeGB
+| sort by TotalSizeGB desc
